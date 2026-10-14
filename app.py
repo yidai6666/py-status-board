@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import time
+import base64
 import base64 as _b64
 import random
 import string
